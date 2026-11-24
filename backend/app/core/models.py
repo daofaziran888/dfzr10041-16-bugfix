@@ -226,6 +226,13 @@ class EventRecord:
     source_host: str
     store_partition: str = ""
     index_state: str = "已写入"
+    # 去重/采样回溯信息：所属窗口区间、批次、样本。
+    window_start: datetime | None = None
+    window_end: datetime | None = None
+    window_basis: dict[str, Any] = field(default_factory=dict)
+    batch_id: str = ""
+    sample_id: str = ""
+    sample: Any = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -343,3 +350,239 @@ class ForwardRule:
     batch_size: int = 100
     retry_limit: int = 3
     timeout_seconds: int = 30
+
+# ---------- 去重窗口 / 去重后采样批次 / 样本 / 调查 ----------
+# 这些模型把“有效重复区间”持久化下来：每个窗口记录指纹、区间依据、
+# 实际代表和全部成员原行；批次是窗口与保留事件的不可变快照；样本记录
+# 原始发生时间和所属区间，供调查刷新与回溯查询。
+
+
+@dataclass
+class DedupWindow:
+    """某个指纹的一段有效重复区间——去重窗口的持久化依据。
+
+    start_time/end_time 是窗口实际生效的区间，representative 是区间内
+    仍合法的最早原行（首见代表）；members 保存窗口内全部原行（包含重复
+    行与被撤回行），用于来源更正后从仍合法原行补出代表。
+    """
+    fingerprint: str
+    rule_id: str
+    window_minutes: int
+    start_time: datetime
+    end_time: datetime
+    representative: EventRecord | None = None
+    members: list[EventRecord] = field(default_factory=list)
+    state: str = "pending"  # pending / claimed / delivered / confirmed
+    replaced_representative_ids: list[str] = field(default_factory=list)
+    # 窗口内重复数（命中/忽略按实际原行重算，覆盖而非累加）。
+    duplicate_count: int = 0
+    # 更正来源后需要保留的既有区间：即使代表被撤回也从区间内合法原行补位。
+    preserve_interval: bool = False
+
+    @property
+    def representative_id(self) -> str:
+        return self.representative.record_id if self.representative else ""
+
+    @property
+    def member_ids(self) -> list[str]:
+        return [member.record_id for member in self.members]
+
+    @property
+    def anchor_time(self) -> datetime:
+        """窗口锚点：代表的原始发生时间；没有代表时退回区间起点。"""
+        return self.representative.event_time if self.representative else self.start_time
+
+    def contains(self, event_time: datetime) -> bool:
+        return self.start_time <= event_time < self.end_time
+
+    def legal_members(self, invalid_ids: set[str] | None = None) -> list[EventRecord]:
+        invalid = invalid_ids or set()
+        return [member for member in self.members if member.record_id not in invalid]
+
+    def duplicate_count(self, invalid_ids: set[str] | None = None) -> int:
+        legal = self.legal_members(invalid_ids)
+        representative_legal = bool(
+            self.representative
+            and self.representative.record_id not in (invalid_ids or set())
+        )
+        return max(0, len(legal) - (1 if representative_legal else 0))
+
+    def basis(self) -> dict[str, object]:
+        """窗口依据：规则、指纹、窗口长度、锚点、区间和代表。"""
+        return {
+            "rule_id": self.rule_id,
+            "fingerprint": self.fingerprint,
+            "window_minutes": self.window_minutes,
+            "anchor_time": self.anchor_time.isoformat(),
+            "window_start": self.start_time.isoformat(),
+            "window_end": self.end_time.isoformat(),
+            "representative_id": self.representative_id,
+            "state": self.state,
+        }
+
+    def snapshot(self) -> "DedupWindow":
+        """生成不可变快照，供批次保存，避免并发读到同一指纹的两个版本。"""
+        return DedupWindow(
+            fingerprint=self.fingerprint,
+            rule_id=self.rule_id,
+            window_minutes=self.window_minutes,
+            start_time=self.start_time,
+            end_time=self.end_time,
+            representative=self.representative,
+            members=list(self.members),
+            state=self.state,
+            replaced_representative_ids=list(self.replaced_representative_ids),
+            duplicate_count=self.duplicate_count,
+            preserve_interval=self.preserve_interval,
+        )
+
+
+@dataclass
+class DedupedSampleBatch:
+    """可复查的去重后采样批次——去重端交给采样端的证据快照。
+
+    retained 是此刻实际保留的全部真实事件；deliverable 是本批次尚未交付
+    给采样计划的代表；windows 保存窗口依据。已确认批次不会被迟到结果改写。
+    """
+    batch_id: str
+    investigation_id: str | None
+    rule_id: str
+    event_type_id: str
+    window_minutes: int
+    version: int
+    created_at: datetime
+    retained: list[EventRecord] = field(default_factory=list)
+    deliverable: list[EventRecord] = field(default_factory=list)
+    windows: list[DedupWindow] = field(default_factory=list)
+    hit_count: int = 0
+    ignore_count: int = 0
+    state: str = "pending"  # pending / partially_delivered / delivered / confirmed / superseded
+    sample_ids: list[str] = field(default_factory=list)
+    raw_record_ids: list[str] = field(default_factory=list)
+    invalid_record_ids: list[str] = field(default_factory=list)
+    legal_record_ids: list[str] = field(default_factory=list)
+    delivered_ids: list[str] = field(default_factory=list)
+    claimed_ids: list[str] = field(default_factory=list)
+    settled_ids: list[str] = field(default_factory=list)
+    conflicts: list[dict[str, object]] = field(default_factory=list)
+    basis_signature: str = ""
+    acknowledged: bool = False
+    acknowledged_at: datetime | None = None
+    confirm_count: int = 0
+    confirmed_at: datetime | None = None
+    delivered_at: datetime | None = None
+    superseded_by: str | None = None
+
+    @property
+    def retained_ids(self) -> list[str]:
+        return [record.record_id for record in self.retained]
+
+    @property
+    def deliverable_ids(self) -> list[str]:
+        return [record.record_id for record in self.deliverable]
+
+    @property
+    def pending_records(self) -> list[EventRecord]:
+        return list(self.deliverable)
+
+    def window_for(self, record_id: str) -> DedupWindow | None:
+        for window in self.windows:
+            if window.representative_id == record_id:
+                return window
+        for window in self.windows:
+            if record_id in window.member_ids:
+                return window
+        return None
+
+    def retained_window_basis(self) -> list[dict[str, object]]:
+        return [window.basis() for window in self.windows]
+
+
+# 兼容不同命名习惯的别名，保持调用侧语义清晰。
+DedupBatch = DedupedSampleBatch
+DedupSampleBatch = DedupedSampleBatch
+
+
+@dataclass
+class Sample:
+    """采样代表——记录原始发生时间、所属去重窗口和所属批次/调查。"""
+    sample_id: str
+    batch_id: str
+    investigation_id: str | None
+    plan_id: str
+    record_id: str
+    event_time: datetime
+    window_start: datetime
+    window_end: datetime
+    fingerprint: str = ""
+    merge_key: str = ""
+    state: str = "pending"  # pending / claimed / delivered / confirmed / superseded
+    created_at: datetime = field(default_factory=datetime.now)
+    confirmed_at: datetime | None = None
+    superseded_by: str | None = None
+    window_basis: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "sample_id": self.sample_id,
+            "batch_id": self.batch_id,
+            "investigation_id": self.investigation_id,
+            "plan_id": self.plan_id,
+            "record_id": self.record_id,
+            "event_time": self.event_time.isoformat(),
+            "window_start": self.window_start.isoformat(),
+            "window_end": self.window_end.isoformat(),
+            "fingerprint": self.fingerprint,
+            "state": self.state,
+        }
+
+
+SampleRecord = Sample
+
+
+@dataclass
+class Investigation:
+    """一次去重采样调查——持有原始行、窗口、批次和样本的完整证据链。
+
+    调查自身保存 raw_records 快照，来源更正只作用于被更正的那个调查；
+    已发出的旧调查仍能用旧证据复算，旧批次和旧代表也一直可按编号查回。
+    """
+    investigation_id: str
+    rule: DedupFilter
+    window_minutes: int
+    created_at: datetime = field(default_factory=datetime.now)
+    config: SampleConfig | None = None
+    state: str = "进行中"
+    raw_records: dict[str, EventRecord] = field(default_factory=dict)
+    invalid_ids: set[str] = field(default_factory=set)
+    windows: list[DedupWindow] = field(default_factory=list)
+    batch_ids: list[str] = field(default_factory=list)
+    sample_ids: list[str] = field(default_factory=list)
+    origin_investigation_id: str | None = None
+    superseded_by: str | None = None
+    delivered_ids: set[str] = field(default_factory=set)
+    claimed_ids: set[str] = field(default_factory=set)
+    settled_ids: set[str] = field(default_factory=set)
+    confirmed_batch_ids: list[str] = field(default_factory=list)
+    version: int = 0
+    hit_count: int = 0
+    ignore_count: int = 0
+    last_batch_id: str | None = None
+
+    @property
+    def rule_id(self) -> str:
+        return self.rule.rule_id
+
+    @property
+    def event_type_id(self) -> str:
+        return self.rule.event_type_id
+
+    def legal_records(self) -> list[EventRecord]:
+        return [
+            record for record_id, record in self.raw_records.items()
+            if record_id not in self.invalid_ids
+        ]
+
+    def add_records(self, records: list[EventRecord]) -> None:
+        for record in records:
+            self.raw_records[record.record_id] = record

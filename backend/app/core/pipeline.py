@@ -11,10 +11,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from app.core.dedup_sample import DedupSamplePipeline
 from app.core.models import (
-    BatchCheckpoint, EventRecord, EventTypeDef, IngestJob, IngestMetric,
-    LogEntry, LogFormat, LogSourceConfig, ParseResultStatus, ParseRule,
-    QualityReport,
+    BatchCheckpoint, DedupFilter, EventRecord, EventTypeDef, IngestJob,
+    IngestMetric, LogEntry, LogFormat, LogSourceConfig, ParseResultStatus,
+    ParseRule, QualityReport, SampleConfig,
 )
 
 # ---------- 预置日志来源配置 ----------
@@ -246,44 +247,53 @@ class IngestPipeline:
 
     # ---------- 数据流 4: event_type → dedup_filter → sample_job ----------
 
-    def dedup_events(self, records: list[EventRecord], dedup_fields: list[str]) -> list[EventRecord]:
+    def dedup_events(self, records: list[EventRecord], dedup_fields: list[str],
+                     window_minutes: int = 60) -> list[EventRecord]:
         """对事件记录集合执行去重过滤——对应 dedup_filter 模块。
 
         使用 SHA256 指纹算法，基于指定的去重字段生成指纹。
+        有效重复区间按记录实际发生时间计算：只有落在代表窗口
+        ``[代表时间, 代表时间 + window_minutes)`` 内的同指纹记录才被忽略，
+        超过窗口的后续记录会重新保留（不再永久当作已见）。
         """
-        seen: set[str] = set()
-        unique: list[EventRecord] = []
-        for record in records:
-            key_parts = [record.event_type.type_id]
-            for field in sorted(dedup_fields):
-                val = record.parsed_fields.get(field, "")
-                key_parts.append(f"{field}={val}")
-            fp = hashlib.sha256("|".join(key_parts).encode()).hexdigest()
-            if fp in seen:
-                continue
-            seen.add(fp)
-            unique.append(record)
-        return unique
+        return DedupSamplePipeline().deduplicate(
+            records,
+            DedupFilter(
+                rule_id="DEDU-INLINE",
+                event_type_id=records[0].event_type.type_id if records else "",
+                dedup_fields=list(dedup_fields),
+                window_minutes=window_minutes,
+            ),
+        )[0]
 
     def sample_events(self, records: list[EventRecord], sample_ratio: float,
                       merge_key: str = "") -> list[EventRecord]:
         """采样归并——对应 sample_job 模块。
 
-        按 sample_ratio 采样，按 merge_key 归并（同 key 仅保留最新）。
+        按 sample_ratio 采样，按 merge_key 归并（同 key 仅保留最新）；
+        采样从去重后批次的保留事件读取，结果携带原始发生时间与所属区间。
         """
-        sampled: list[EventRecord] = []
-        merged: dict[str, EventRecord] = {}
-        threshold = int(len(records) * sample_ratio)
-        for i, record in enumerate(records):
-            if merge_key:
-                mkey = record.parsed_fields.get(merge_key, "")
-                if mkey:
-                    merged[mkey] = record
-            if i < threshold:
-                sampled.append(record)
-        if merge_key:
-            return list(merged.values())
-        return sampled
+        config = SampleConfig(
+            plan_id="SAMP-INLINE",
+            event_type_id=records[0].event_type.type_id if records else "",
+            sample_ratio=sample_ratio,
+            merge_key=merge_key,
+        )
+        pipeline = DedupSamplePipeline()
+        pipeline.deduplicate(
+            records,
+            DedupFilter(
+                rule_id="DEDU-INLINE",
+                event_type_id=config.event_type_id,
+                dedup_fields=[],
+                window_minutes=0,
+            ),
+        )
+        batch = pipeline.latest_batch()
+        if batch is not None:
+            sampled = pipeline.sample(batch, config)
+            return list(sampled)
+        return list(pipeline.sample(records, config, claim=False))
 
     # ---------- 数据流 6: archive_policy → event_store ----------
 
